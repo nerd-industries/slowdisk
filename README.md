@@ -21,7 +21,7 @@ $env:NN_SLOWDISK = 'revert'; irm slowdisk.nerdyneighbor.net | iex
 
 Options (set before the irm line):
 
-| Variable | Values | Effect | yes |
+| Variable | Values | Effect |
 |---|---|---|
 | `NN_SLOWDISK` | `auto` (default), `hdd`, `emmc`, `lowspec`, `report`, `revert` | Profile / mode. Combine a profile with report: `lowspec,report` |
 | `NN_SLOWDISK_COMPACT` | `no` | eMMC: skip CompactOS (it can take 10-30 min) |
