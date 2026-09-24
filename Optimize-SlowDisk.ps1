@@ -56,6 +56,22 @@ function Write-Log {
     }
 }
 
+# Run a console tool without letting its stderr become a terminating error
+# (Windows PowerShell 5.1 + ErrorActionPreference=Stop turns `2>&1` output
+# into exceptions). Returns the output lines; $LASTEXITCODE is set as usual.
+function Invoke-Native {
+    param([string]$Exe, [Parameter(ValueFromRemainingArguments = $true)][string[]]$ArgList)
+    $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try { & $Exe @ArgList 2>&1 | ForEach-Object { "$_" } }
+    finally { $ErrorActionPreference = $old }
+}
+
+# Each tweak runs on its own, so one failure never stops the rest.
+function Invoke-Step([string]$Name, [scriptblock]$Block) {
+    try { & $Block }
+    catch { Write-Log "$Name - skipped: $($_.Exception.Message)" 'WARN'; $script:Skipped++ }
+}
+
 # --- Options -----------------------------------------------------------------
 $Mode = "$env:NN_SLOWDISK".Trim().ToLower()
 if (-not $Mode) { $Mode = 'auto' }
@@ -155,7 +171,7 @@ function Set-Svc([string]$Name, [string]$Mode, [string]$Label) {
     Note-Change "$Label ($cur -> $Mode)"
     if ($DryRun) { return }
     Add-Record @{ Id = "svc|$Name"; Kind = 'svc'; Name = $Name; OldValue = $cur }
-    & sc.exe config $Name start= $Mode | Out-Null
+    Invoke-Native sc.exe config $Name start= $Mode | Out-Null
     if ($LASTEXITCODE -ne 0) { Write-Log "sc.exe config $Name failed (exit $LASTEXITCODE)" 'WARN'; return }
     if ($Mode -eq 'disabled') { Stop-Service -Name $Name -Force -ErrorAction SilentlyContinue }
     elseif ($Mode -like '*auto') { Start-Service -Name $Name -ErrorAction SilentlyContinue }
@@ -179,7 +195,7 @@ function Invoke-ForEachUserHive([scriptblock]$Action) {
         $weLoaded = $false
         if (-not (Test-Path $root)) {
             if (-not (Test-Path $t.File)) { continue }
-            & reg.exe load "HKU\$($t.Sid)" "$($t.File)" 2>&1 | Out-Null
+            Invoke-Native reg.exe load "HKU\$($t.Sid)" "$($t.File)" | Out-Null
             if ($LASTEXITCODE -ne 0) { Write-Log "Could not load profile $($t.Name) - skipped." 'WARN'; continue }
             $weLoaded = $true
         }
@@ -188,7 +204,7 @@ function Invoke-ForEachUserHive([scriptblock]$Action) {
         finally {
             if ($weLoaded) {
                 [gc]::Collect(); [gc]::WaitForPendingFinalizers()
-                & reg.exe unload "HKU\$($t.Sid)" 2>&1 | Out-Null
+                Invoke-Native reg.exe unload "HKU\$($t.Sid)" | Out-Null
             }
         }
     }
@@ -251,7 +267,7 @@ function Invoke-Revert {
                 'reg' {
                     $weLoaded = $false
                     if ($c.HiveSid -and -not (Test-Path "Registry::HKEY_USERS\$($c.HiveSid)")) {
-                        & reg.exe load "HKU\$($c.HiveSid)" "$($c.HiveFile)" 2>&1 | Out-Null
+                        Invoke-Native reg.exe load "HKU\$($c.HiveSid)" "$($c.HiveFile)" | Out-Null
                         if ($LASTEXITCODE -ne 0) { throw "could not load hive for $($c.HiveSid)" }
                         $weLoaded = $true
                     }
@@ -270,12 +286,12 @@ function Invoke-Revert {
                             New-ItemProperty -Path $c.Path -Name $c.Name -Value $v -PropertyType $c.OldKind -Force | Out-Null
                         }
                     } finally {
-                        if ($weLoaded) { [gc]::Collect(); [gc]::WaitForPendingFinalizers(); & reg.exe unload "HKU\$($c.HiveSid)" 2>&1 | Out-Null }
+                        if ($weLoaded) { [gc]::Collect(); [gc]::WaitForPendingFinalizers(); Invoke-Native reg.exe unload "HKU\$($c.HiveSid)" | Out-Null }
                     }
                     Write-Log "Restored $($c.Path -replace '^Registry::','')\$($c.Name)" 'OK'
                 }
                 'svc' {
-                    & sc.exe config $c.Name start= $c.OldValue | Out-Null
+                    Invoke-Native sc.exe config $c.Name start= $c.OldValue | Out-Null
                     if ($c.OldValue -like '*auto') { Start-Service $c.Name -ErrorAction SilentlyContinue }
                     Write-Log "Service $($c.Name) back to $($c.OldValue)" 'OK'
                 }
@@ -285,7 +301,7 @@ function Invoke-Revert {
                     Write-Log "Scheduled task $($c.Name) back to $($c.OldValue)" 'OK'
                 }
                 'lastaccess' {
-                    & fsutil.exe behavior set disablelastaccess $c.OldValue | Out-Null
+                    Invoke-Native fsutil.exe behavior set disablelastaccess $c.OldValue | Out-Null
                     Write-Log "NTFS last-access setting back to $($c.OldValue)" 'OK'
                 }
                 'mmagent' {
@@ -300,16 +316,17 @@ function Invoke-Revert {
                     Write-Log "Defender $($c.Name) back to $($c.OldValue)" 'OK'
                 }
                 'hiber' {
-                    if (-not $c.OldEnabled) { & powercfg.exe /hibernate off | Out-Null }
+                    if (-not $c.OldEnabled) { Invoke-Native powercfg.exe /hibernate off | Out-Null }
                     else {
-                        & powercfg.exe /hibernate on | Out-Null
-                        if ($c.OldType) { & powercfg.exe /hibernate /type $c.OldType | Out-Null }
+                        Invoke-Native powercfg.exe /hibernate on | Out-Null
+                        if ($c.OldType) { Invoke-Native powercfg.exe /hibernate /type $c.OldType | Out-Null }
+                        if ($c.OldSize) { Invoke-Native powercfg.exe /hibernate /size $c.OldSize | Out-Null }
                     }
                     Write-Log "Hibernation back to $(if ($c.OldEnabled) { "on ($($c.OldType))" } else { 'off' })" 'OK'
                 }
                 'compactos' {
                     Write-Log "Decompressing Windows (CompactOS off) - this can take 20+ minutes..." 'WARN'
-                    & compact.exe /compactos:never | Out-Null
+                    Invoke-Native compact.exe /compactos:never | Out-Null
                     Write-Log "CompactOS turned off" 'OK'
                 }
                 'pagefile' {
@@ -383,18 +400,21 @@ try {
     Write-Log "Applying the $($diskProfile.ToUpper()) profile" 'HEAD'
 
     # ---- 1. NTFS last-access timestamps (a write on every file read) -----------
-    $q = (& fsutil.exe behavior query disablelastaccess) -join ' '
+    Invoke-Step 'NTFS last-access timestamps' {
+    $q = (Invoke-Native fsutil.exe behavior query disablelastaccess) -join ' '
     $curLA = if ($q -match '=\s*(\d)') { [int]$Matches[1] } else { -1 }
     if ($curLA -in 1, 3) { Note-Same "NTFS last-access updates off" }
     else {
         Note-Change "NTFS last-access updates off (was $curLA)"
         if (-not $DryRun) {
             Add-Record @{ Id = 'lastaccess'; Kind = 'lastaccess'; OldValue = $curLA }
-            & fsutil.exe behavior set disablelastaccess 1 | Out-Null
+            Invoke-Native fsutil.exe behavior set disablelastaccess 1 | Out-Null
         }
+    }
     }
 
     # ---- 2. SysMain + memory compression --------------------------------------
+    Invoke-Step 'SysMain + memory compression' {
     # SysMain does boot/app prefetch (ReadyBoot) - built for HDDs - and memory
     # compression, which keeps low-RAM machines from paging to the slow disk.
     if ($OptSysMain -eq 'off') {
@@ -421,8 +441,10 @@ try {
             if (-not $DryRun) { Add-Record @{ Id = 'mm|ApplicationPreLaunch'; Kind = 'mmagent'; Name = 'ApplicationPreLaunch'; OldValue = $true }; Disable-MMAgent -ApplicationPreLaunch }
         }
     } catch { Write-Log "Memory manager settings skipped: $($_.Exception.Message)" 'WARN'; $script:Skipped++ }
+    }
 
     # ---- 3. Windows Search indexer --------------------------------------------
+    Invoke-Step 'Windows Search indexer' {
     $hasOutlook = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\OUTLOOK.EXE'
     $searchOff = $false
     if     ($OptSearch -eq 'off')  { $searchOff = $true }
@@ -435,8 +457,10 @@ try {
     } else {
         Write-Log "Search indexer kept (eMMC handles it OK; Start menu/Settings search rely on it)."
     }
+    }
 
     # ---- 4. Hibernation / Fast Startup ----------------------------------------
+    Invoke-Step 'Hibernation / Fast Startup' {
     # Fast Startup needs the hiberfile. Reduced type = ~20% of RAM, no user hibernate.
     $powerKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Power'
     $pk = Get-ItemProperty $powerKey -ErrorAction SilentlyContinue
@@ -450,10 +474,21 @@ try {
         else {
             Note-Change "Fast Startup on with a reduced hiberfile (~$hiberNeedGB GB) - faster cold boots"
             if (-not $DryRun) {
-                Add-Record @{ Id = 'hiber'; Kind = 'hiber'; OldEnabled = $hiberOn; OldType = $hiberTyp }
-                & powercfg.exe /hibernate on 2>&1 | Out-Null
-                & powercfg.exe /hibernate /type reduced 2>&1 | Out-Null
-                if ($LASTEXITCODE -ne 0) { Write-Log "powercfg couldn't enable hibernation on this PC (firmware/VM) - Fast Startup unavailable." 'WARN' }
+                Add-Record @{ Id = 'hiber'; Kind = 'hiber'; OldEnabled = $hiberOn; OldType = $hiberTyp; OldSize = $pk.HiberFileSizePercent }
+                $o = Invoke-Native powercfg.exe /hibernate on
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Log "Hibernation isn't available on this PC ($(($o -join ' ').Trim())) - Fast Startup skipped." 'WARN'; $script:Skipped++
+                } else {
+                    # A custom hiberfile size makes '/type reduced' fail with
+                    # "The provided hiber file type is invalid" - clear it first.
+                    Invoke-Native powercfg.exe /hibernate /size 0 | Out-Null
+                    Remove-ItemProperty -Path $powerKey -Name 'HiberFileSizePercent' -ErrorAction SilentlyContinue
+                    $o = Invoke-Native powercfg.exe /hibernate /type reduced
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Log "Reduced hiberfile not accepted ($(($o -join ' ').Trim())) - using the full size so Fast Startup still works." 'WARN'
+                        Invoke-Native powercfg.exe /hibernate /type full | Out-Null
+                    }
+                }
             }
         }
         Set-Reg 'Registry::HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Session Manager\Power' `
@@ -464,12 +499,14 @@ try {
             Note-Change 'Hibernation off (disk space is too tight on this eMMC)'
             if (-not $DryRun) {
                 Add-Record @{ Id = 'hiber'; Kind = 'hiber'; OldEnabled = $hiberOn; OldType = $hiberTyp }
-                & powercfg.exe /hibernate off 2>&1 | Out-Null
+                Invoke-Native powercfg.exe /hibernate off | Out-Null
             }
         }
     }
+    }
 
     # ---- 5. Defender: throttle scans, never disable ---------------------------
+    Invoke-Step 'Defender: throttle scans, never disable' {
     try {
         $mp = Get-MpComputerStatus
         if (-not $mp.AntivirusEnabled -or ($mp.AMRunningMode -and $mp.AMRunningMode -ne 'Normal')) {
@@ -493,8 +530,10 @@ try {
             }
         }
     } catch { Write-Log "Defender settings skipped: $($_.Exception.Message)" 'WARN'; $script:Skipped++ }
+    }
 
     # ---- 6. Compatibility Appraiser (CompatTelRunner full-disk scans) ---------
+    Invoke-Step 'Compatibility Appraiser' {
     $tasks = @()
     try {
         $tasks += Get-ScheduledTask -TaskPath '\Microsoft\Windows\Application Experience\' -ErrorAction SilentlyContinue |
@@ -509,13 +548,17 @@ try {
             Add-Record @{ Id = "task|$($t.TaskName)"; Kind = 'task'; TaskPath = $t.TaskPath; Name = $t.TaskName; OldValue = 'Ready' }
         } catch { Write-Log "Couldn't disable $($t.TaskName): $($_.Exception.Message)" 'WARN'; $script:Skipped++ }
     }
+    }
 
     # ---- 7. Edge running in the background ------------------------------------
+    Invoke-Step 'Edge running in the background' {
     $edgePol = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Edge'
     Set-Reg $edgePol 'StartupBoostEnabled'   0 'DWord' 'Edge Startup Boost off'
     Set-Reg $edgePol 'BackgroundModeEnabled' 0 'DWord' 'Edge background mode off'
+    }
 
     # ---- 8. Page file safety net ----------------------------------------------
+    Invoke-Step 'Page file safety net' {
     $cs = Get-CimInstance Win32_ComputerSystem
     $pfs = @(Get-CimInstance Win32_PageFileSetting -ErrorAction SilentlyContinue)
     if (-not $cs.AutomaticManagedPagefile -and $pfs.Count -eq 0) {
@@ -526,8 +569,10 @@ try {
         }
     } elseif ($cs.AutomaticManagedPagefile) { Note-Same 'Page file system managed' }
     else { Write-Log "Custom page file size in use - left alone." }
+    }
 
     # ---- 9. Drive optimization (defrag for HDD, TRIM for eMMC) ----------------
+    Invoke-Step 'Drive optimization' {
     try {
         $defrag = Get-ScheduledTask -TaskPath '\Microsoft\Windows\Defrag\' -TaskName 'ScheduledDefrag' -ErrorAction Stop
         if ($defrag.State -ne 'Disabled') { Note-Same "Weekly drive optimization on" }
@@ -543,8 +588,10 @@ try {
         try { Optimize-Volume -DriveLetter $drive.Letter -ReTrim -ErrorAction Stop; Write-Log 'TRIM sent to the eMMC' 'OK' }
         catch { Write-Log "TRIM not supported by this eMMC controller - skipped." }
     }
+    }
 
     # ---- 10. Visual effects (every profile + new users) -----------------------
+    Invoke-Step 'Visual effects' {
     if ($OptVisual) {
         Write-Log "Visual effects -> best performance (keeps smooth fonts + thumbnails)"
         $script:before = $script:Changed
@@ -571,12 +618,14 @@ try {
             $script:before = $script:Changed
         }
     } else { Write-Log "Visual effects skipped (NN_SLOWDISK_VISUAL=no)" }
+    }
 
     # ---- 11. CompactOS (eMMC only - fewer bytes to read, frees 2-4 GB) --------
+    Invoke-Step 'CompactOS' {
     if ($isEmmc) {
         if (-not $OptCompact) { Write-Log "CompactOS skipped (NN_SLOWDISK_COMPACT=no)" }
         else {
-            $cq = (& compact.exe /compactos:query) -join ' '
+            $cq = (Invoke-Native compact.exe /compactos:query) -join ' '
             if ($cq -match 'is in the Compact state') { Note-Same 'CompactOS on' }
             elseif ($cq -notmatch 'not in the Compact state') {
                 Write-Log "Couldn't read CompactOS state (non-English Windows?) - skipped." 'WARN'; $script:Skipped++
@@ -585,12 +634,13 @@ try {
                 if (-not $DryRun) {
                     Add-Record @{ Id = 'compactos'; Kind = 'compactos'; OldValue = 'never' }
                     Write-Log "Compressing Windows - this can take 10-30 minutes on eMMC. Don't close this window." 'WARN'
-                    & compact.exe /compactos:always | Out-Null
+                    Invoke-Native compact.exe /compactos:always | Out-Null
                     $after = Get-Volume -DriveLetter $drive.Letter
                     Write-Log ("CompactOS done - free space now {0} GB (was {1} GB)" -f [math]::Round($after.SizeRemaining / 1GB, 1), $drive.FreeGB) 'OK'
                 }
             }
         }
+    }
     }
 
     # ---- Report-only checks (security or user choices - tech decides) ---------
