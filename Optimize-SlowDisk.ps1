@@ -14,7 +14,9 @@
       $env:NN_SLOWDISK = 'auto'     # default - detect the boot drive type
       $env:NN_SLOWDISK = 'hdd'      # force the hard-drive profile
       $env:NN_SLOWDISK = 'emmc'     # force the eMMC profile
+      $env:NN_SLOWDISK = 'lowspec'  # force the low-spec profile (SSD + weak CPU / low RAM)
       $env:NN_SLOWDISK = 'report'   # show what would change, change nothing
+      $env:NN_SLOWDISK = 'lowspec,report'   # a forced profile can be combined with report
       $env:NN_SLOWDISK = 'revert'   # undo everything this script changed
       $env:NN_SLOWDISK_COMPACT = 'no'   # eMMC: skip CompactOS (it can take 20+ min)
       $env:NN_SLOWDISK_VISUAL  = 'no'   # skip "best performance" visual effects
@@ -73,13 +75,16 @@ function Invoke-Step([string]$Name, [scriptblock]$Block) {
 }
 
 # --- Options -----------------------------------------------------------------
-$Mode = "$env:NN_SLOWDISK".Trim().ToLower()
-if (-not $Mode) { $Mode = 'auto' }
-if ($Mode -notin 'auto', 'hdd', 'emmc', 'report', 'revert') {
-    Write-Host "  Unknown NN_SLOWDISK value '$Mode'. Use auto, hdd, emmc, report or revert." -ForegroundColor Red
+$ModeTokens = @("$env:NN_SLOWDISK".ToLower() -split '[,;\s]+' | Where-Object { $_ })
+$badTokens  = @($ModeTokens | Where-Object { $_ -notin 'auto', 'hdd', 'emmc', 'lowspec', 'report', 'revert' })
+if ($badTokens.Count) {
+    Write-Host "  Unknown NN_SLOWDISK value '$($badTokens -join ',')'. Use auto, hdd, emmc, lowspec, report or revert." -ForegroundColor Red
     return
 }
-$DryRun      = ($Mode -eq 'report')
+$DryRun = $ModeTokens -contains 'report'
+$Mode   = 'auto'
+if ($ModeTokens -contains 'revert') { $Mode = 'revert' }
+foreach ($t in 'hdd', 'emmc', 'lowspec') { if ($ModeTokens -contains $t) { $Mode = $t } }
 $OptCompact  = "$env:NN_SLOWDISK_COMPACT".Trim().ToLower() -ne 'no'
 $OptVisual   = "$env:NN_SLOWDISK_VISUAL".Trim().ToLower() -ne 'no'
 $OptSearch   = "$env:NN_SLOWDISK_SEARCH".Trim().ToLower()
@@ -208,6 +213,20 @@ function Invoke-ForEachUserHive([scriptblock]$Action) {
             }
         }
     }
+}
+
+# --- CPU detection -----------------------------------------------------------
+# "Low-end" = 4 or fewer threads, or a budget/old family name.
+function Get-CpuInfo {
+    $p = @(Get-CimInstance Win32_Processor)
+    $name = ("$($p[0].Name)" -replace '\s+', ' ').Trim()
+    $threads = [int](($p | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum)
+    $why = @()
+    if ($threads -le 4) { $why += "$threads threads" }
+    if ($name -match 'Celeron|Pentium|Atom|Athlon|Sempron|Turion|Phenom|Core\(TM\)2|Core 2|\bA(4|6|8|9|10|12)-\d|\bE[12]-\d|\bN\d{3,4}\b|i3-[2-7]\d{3}') {
+        $why += 'budget/older family'
+    }
+    [pscustomobject]@{ Name = $name; Threads = $threads; Weak = [bool]$why.Count; Why = ($why -join ', ') }
 }
 
 # --- Drive detection ---------------------------------------------------------
@@ -355,7 +374,7 @@ try {
     Write-Host ""
     Write-Host "  Nerdy Neighbor - Slow Disk Optimizer" -ForegroundColor Cyan
     Write-Host ""
-    Write-Log "=== Run started on $env:COMPUTERNAME (user: $env:USERNAME, mode: $Mode) ==="
+    Write-Log "=== Run started on $env:COMPUTERNAME (user: $env:USERNAME, mode: $Mode$(if ($DryRun) { ', report' })) ==="
 
     if ($Mode -eq 'revert') { Invoke-Revert; Write-Host ""; return }
 
@@ -369,9 +388,12 @@ try {
     Write-Log ("Drive  : {0} ({1} GB, bus {2}, media {3})" -f $drive.Name, $drive.SizeGB, $drive.Bus, $drive.Media)
     Write-Log ("Free   : {0} GB ({1}%) on {2}:" -f $drive.FreeGB, $drive.FreePct, $drive.Letter)
     Write-Log ("RAM    : {0} GB" -f $ramGB)
+    $cpu = Get-CpuInfo
+    Write-Log ("CPU    : {0} ({1} threads){2}" -f $cpu.Name, $cpu.Threads, $(if ($cpu.Weak) { " - low-end: $($cpu.Why)" } else { '' }))
+    $lowRam = ($ramGB -le 8.5)
 
     $diskProfile = $drive.Kind
-    if ($Mode -in 'hdd', 'emmc') {
+    if ($Mode -in 'hdd', 'emmc', 'lowspec') {
         Write-Log "Detected '$($drive.Kind)', but NN_SLOWDISK forces '$Mode'." 'WARN'
         $diskProfile = $Mode
     } else {
@@ -379,9 +401,15 @@ try {
     }
 
     if ($diskProfile -eq 'ssd') {
-        Write-Log "This PC boots from an SSD - these tweaks aren't needed. Nothing changed." 'OK'
-        Write-Log "To force it anyway: `$env:NN_SLOWDISK = 'hdd' (or 'emmc') before the irm line."
-        Write-Host ""; return
+        if ($cpu.Weak -or $lowRam) {
+            $why = @(); if ($cpu.Weak) { $why += 'low-end CPU' }; if ($lowRam) { $why += "$ramGB GB RAM" }
+            Write-Log "SSD is fine, but this PC is held back by: $($why -join ' + '). Using the LOW-SPEC profile." 'OK'
+            $diskProfile = 'lowspec'
+        } else {
+            Write-Log "This PC has an SSD, a decent CPU and more than 8 GB RAM - these tweaks aren't needed. Nothing changed." 'OK'
+            Write-Log "To force it anyway: `$env:NN_SLOWDISK = 'lowspec' before the irm line."
+            Write-Host ""; return
+        }
     }
     if ($diskProfile -eq 'unknown') {
         $answer = $null
@@ -395,12 +423,13 @@ try {
             Write-Host ""; return
         }
     }
-    $isHdd = ($diskProfile -eq 'hdd'); $isEmmc = ($diskProfile -eq 'emmc')
+    $isHdd = ($diskProfile -eq 'hdd'); $isEmmc = ($diskProfile -eq 'emmc'); $isLow = ($diskProfile -eq 'lowspec')
     if ($DryRun) { Write-Log "REPORT MODE - nothing will be changed." 'WARN' }
     Write-Log "Applying the $($diskProfile.ToUpper()) profile" 'HEAD'
 
     # ---- 1. NTFS last-access timestamps (a write on every file read) -----------
     Invoke-Step 'NTFS last-access timestamps' {
+    if ($isLow) { Write-Log "NTFS last-access left alone (SSD - no benefit)"; return }
     $q = (Invoke-Native fsutil.exe behavior query disablelastaccess) -join ' '
     $curLA = if ($q -match '=\s*(\d)') { [int]$Matches[1] } else { -1 }
     if ($curLA -in 1, 3) { Note-Same "NTFS last-access updates off" }
@@ -455,7 +484,7 @@ try {
     } elseif ($hasOutlook -and $isHdd) {
         Write-Log "Search indexer kept - classic Outlook is installed and its search needs it." 'WARN'
     } else {
-        Write-Log "Search indexer kept (eMMC handles it OK; Start menu/Settings search rely on it)."
+        Write-Log "Search indexer kept ($(if ($isLow) { 'SSD' } else { 'eMMC' }) handles it OK; Start menu/Settings search rely on it)."
     }
     }
 
@@ -669,6 +698,11 @@ try {
         if (@($dg.SecurityServicesRunning) -contains 2) { Write-Log "Memory Integrity (HVCI) is ON - costs speed on older/low-end CPUs. Security tradeoff: decide per client." 'WARN' }
         else { Write-Log "Memory Integrity off" }
     } catch { }
+    if ($isLow -and $cpu.Weak) {
+        $cq = (Invoke-Native compact.exe /compactos:query) -join ' '
+        if ($cq -match 'is in the Compact state') { Write-Log "CompactOS is ON - on an SSD with a weak CPU the decompression can cost more than it saves. Undo: compact /compactos:never" 'WARN' }
+    }
+    if ($isLow -and $lowRam) { Write-Log "RAM is the main limit here - a RAM upgrade (if not soldered) will help more than any tweak." 'WARN' }
     if ($isHdd) { Write-Log "Best fix for this PC is still a SATA SSD swap (~`$25-40) - bigger than every tweak combined." 'WARN' }
     $startup = @(Get-CimInstance Win32_StartupCommand -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name -Unique)
     if ($startup.Count) { Write-Log ("Startup apps ({0}): {1}" -f $startup.Count, ($startup -join ', ')) }
