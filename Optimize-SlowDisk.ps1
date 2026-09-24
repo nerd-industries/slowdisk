@@ -231,44 +231,83 @@ function Get-CpuInfo {
 
 # --- Drive detection ---------------------------------------------------------
 function Get-BootDriveInfo {
+    # The Storage cmdlets (Get-Partition/Get-Disk/Get-Volume) come back empty on
+    # some PCs - Intel RST/RAID mode, dynamic disks, or a damaged storage WMI -
+    # so every source is optional and classic Win32_* WMI is the fallback.
     $letter = $env:SystemDrive.TrimEnd(':')
-    $part   = Get-Partition -DriveLetter $letter
-    $disk   = Get-Disk -Number $part.DiskNumber
-    $pd     = Get-PhysicalDisk | Where-Object { $_.DeviceId -eq "$($disk.Number)" } | Select-Object -First 1
-    $msft   = Get-CimInstance -Namespace root\Microsoft\Windows\Storage -ClassName MSFT_PhysicalDisk |
-              Where-Object { $_.DeviceId -eq "$($disk.Number)" } | Select-Object -First 1
-    $w32    = Get-CimInstance Win32_DiskDrive | Where-Object { $_.Index -eq $disk.Number } | Select-Object -First 1
+    $notes  = @()
+    $diskNum = $null; $w32 = $null
+    try { $diskNum = [int](Get-Partition -DriveLetter $letter -ErrorAction Stop | Select-Object -First 1).DiskNumber }
+    catch { $notes += 'Get-Partition found nothing' }
+    if ($null -eq $diskNum) {
+        try {
+            $ld  = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($letter):'" -ErrorAction Stop
+            $dp  = Get-CimAssociatedInstance -InputObject $ld -ResultClassName Win32_DiskPartition -ErrorAction Stop | Select-Object -First 1
+            $w32 = Get-CimAssociatedInstance -InputObject $dp -ResultClassName Win32_DiskDrive -ErrorAction Stop | Select-Object -First 1
+            if ($w32) { $diskNum = [int]$w32.Index; $notes += 'found via Win32 WMI' }
+        } catch { $notes += 'Win32 partition lookup failed' }
+    }
+    if ($null -eq $diskNum) {
+        $fixed = @(Get-CimInstance Win32_DiskDrive -ErrorAction SilentlyContinue |
+                   Where-Object { $_.MediaType -match 'Fixed' -and $_.InterfaceType -ne 'USB' })
+        if ($fixed.Count -eq 1) { $w32 = $fixed[0]; $diskNum = [int]$w32.Index; $notes += 'only one internal disk' }
+    }
 
-    $bus    = "$($disk.BusType)"
-    $media  = if ($pd) { "$($pd.MediaType)" } else { 'Unspecified' }
-    $spin   = if ($msft) { [uint32]$msft.SpindleSpeed } else { 0 }
-    $name   = "$($disk.FriendlyName)"
-    $pnp    = if ($w32) { "$($w32.PNPDeviceID)" } else { '' }
-    $model  = "$((Get-CimInstance Win32_ComputerSystem).Model)"
+    $disk = $null; $pd = $null; $msft = $null
+    if ($null -ne $diskNum) {
+        if (-not $w32) { $w32 = Get-CimInstance Win32_DiskDrive -ErrorAction SilentlyContinue | Where-Object { $_.Index -eq $diskNum } | Select-Object -First 1 }
+        try { $disk = Get-Disk -Number $diskNum -ErrorAction Stop } catch { }
+        try { $pd = Get-PhysicalDisk -ErrorAction Stop | Where-Object { $_.DeviceId -eq "$diskNum" } | Select-Object -First 1 } catch { }
+        try {
+            $msft = Get-CimInstance -Namespace root\Microsoft\Windows\Storage -ClassName MSFT_PhysicalDisk -ErrorAction Stop |
+                    Where-Object { $_.DeviceId -eq "$diskNum" } | Select-Object -First 1
+        } catch { }
+    }
+    # With RAID/RST, the one "disk" Windows sees may be an array; Get-PhysicalDisk
+    # still lists the real drives. If there's exactly one, use it.
+    if (-not $pd) {
+        try {
+            $real = @(Get-PhysicalDisk -ErrorAction Stop | Where-Object { $_.BusType -notin 'USB', 'File Backed Virtual' })
+            if ($real.Count -eq 1) { $pd = $real[0]; $notes += 'using the only physical disk' }
+        } catch { }
+    }
+
+    $bus   = if ($disk) { "$($disk.BusType)" } elseif ($pd) { "$($pd.BusType)" } elseif ($w32) { "$($w32.InterfaceType)" } else { '?' }
+    $media = if ($pd) { "$($pd.MediaType)" } else { 'Unspecified' }
+    $spin  = if ($msft) { [uint32]$msft.SpindleSpeed } else { 0 }
+    $name  = if ($pd -and $pd.FriendlyName) { "$($pd.FriendlyName)" } elseif ($disk) { "$($disk.FriendlyName)" } elseif ($w32) { "$($w32.Model)" } else { '?' }
+    $pnp   = if ($w32) { "$($w32.PNPDeviceID)" } else { '' }
+    $model = "$((Get-CimInstance Win32_ComputerSystem).Model)"
+    $sizeB = if ($disk) { $disk.Size } elseif ($pd) { $pd.Size } elseif ($w32) { $w32.Size } else { 0 }
 
     $kind = 'unknown'; $why = ''
     if ($bus -in 'SD', 'MMC' -or $pnp -match '^(SD|MMC)\\' -or $name -match '\beMMC\b|\bMMC\b') {
         $kind = 'emmc'; $why = "bus type $bus"
-    } elseif ($bus -in 'NVMe', 'UFS', 'SCM') {
-        $kind = 'ssd';  $why = "bus type $bus"
+    } elseif ($bus -in 'NVMe', 'UFS', 'SCM' -or ($pd -and "$($pd.BusType)" -eq 'NVMe') -or $name -match 'NVMe') {
+        $kind = 'ssd';  $why = "NVMe/UFS bus"
     } elseif ($media -eq 'HDD') {
         $kind = 'hdd';  $why = 'Windows reports a rotational drive (seek penalty)'
     } elseif ($media -eq 'SSD') {
         $kind = 'ssd';  $why = 'Windows reports no seek penalty'
     } elseif ($spin -gt 0 -and $spin -lt 100000) {
         $kind = 'hdd';  $why = "spindle speed $spin RPM"
-    } elseif ($name -match 'SSD|NVMe|Solid') {
+    } elseif ($name -match 'SSD|Solid') {
         $kind = 'ssd';  $why = 'model name'
     }
     if ($model -match 'Virtual|VMware|KVM|QEMU' -and $kind -eq 'unknown') { $why = 'virtual machine' }
 
-    $vol = Get-Volume -DriveLetter $letter
+    $freeB = 0; $volB = 0
+    try { $vol = Get-Volume -DriveLetter $letter -ErrorAction Stop; $freeB = $vol.SizeRemaining; $volB = $vol.Size }
+    catch {
+        $ld = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($letter):'" -ErrorAction SilentlyContinue
+        if ($ld) { $freeB = $ld.FreeSpace; $volB = $ld.Size }
+    }
     [pscustomobject]@{
         Kind = $kind; Why = $why; Bus = $bus; Media = $media; Name = $name
-        SizeGB = [math]::Round($disk.Size / 1GB, 0)
-        FreeGB = [math]::Round($vol.SizeRemaining / 1GB, 1)
-        FreePct = if ($vol.Size) { [math]::Round(100 * $vol.SizeRemaining / $vol.Size, 0) } else { 0 }
-        Letter = $letter
+        SizeGB = [math]::Round($sizeB / 1GB, 0)
+        FreeGB = [math]::Round($freeB / 1GB, 1)
+        FreePct = if ($volB) { [math]::Round(100 * $freeB / $volB, 0) } else { 0 }
+        Letter = $letter; Notes = ($notes -join '; ')
     }
 }
 
@@ -387,6 +426,7 @@ try {
     $ramGB = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)
     Write-Log ("Drive  : {0} ({1} GB, bus {2}, media {3})" -f $drive.Name, $drive.SizeGB, $drive.Bus, $drive.Media)
     Write-Log ("Free   : {0} GB ({1}%) on {2}:" -f $drive.FreeGB, $drive.FreePct, $drive.Letter)
+    if ($drive.Notes) { Write-Log ("Note   : {0}" -f $drive.Notes) }
     Write-Log ("RAM    : {0} GB" -f $ramGB)
     $cpu = Get-CpuInfo
     Write-Log ("CPU    : {0} ({1} threads){2}" -f $cpu.Name, $cpu.Threads, $(if ($cpu.Weak) { " - low-end: $($cpu.Why)" } else { '' }))
@@ -400,6 +440,18 @@ try {
         Write-Log "Detected: $($drive.Kind.ToUpper()) ($($drive.Why))" 'OK'
     }
 
+    if ($diskProfile -eq 'unknown') {
+        $answer = $null
+        if ([Environment]::UserInteractive -and $Host.Name -eq 'ConsoleHost') {
+            Write-Log "Couldn't tell what kind of drive this is." 'WARN'
+            $answer = (Read-Host "  Type hdd, emmc, ssd, or press Enter to cancel").Trim().ToLower()
+        }
+        if ($answer -in 'hdd', 'emmc', 'ssd') { $diskProfile = $answer }
+        else {
+            Write-Log "Drive type unknown - nothing changed. Set `$env:NN_SLOWDISK = 'hdd', 'emmc' or 'lowspec' and run again." 'WARN'
+            Write-Host ""; return
+        }
+    }
     if ($diskProfile -eq 'ssd') {
         if ($cpu.Weak -or $lowRam) {
             $why = @(); if ($cpu.Weak) { $why += 'low-end CPU' }; if ($lowRam) { $why += "$ramGB GB RAM" }
@@ -408,18 +460,6 @@ try {
         } else {
             Write-Log "This PC has an SSD, a decent CPU and more than 8 GB RAM - these tweaks aren't needed. Nothing changed." 'OK'
             Write-Log "To force it anyway: `$env:NN_SLOWDISK = 'lowspec' before the irm line."
-            Write-Host ""; return
-        }
-    }
-    if ($diskProfile -eq 'unknown') {
-        $answer = $null
-        if ([Environment]::UserInteractive -and $Host.Name -eq 'ConsoleHost') {
-            Write-Log "Couldn't tell what kind of drive this is." 'WARN'
-            $answer = (Read-Host "  Type hdd, emmc, or press Enter to cancel").Trim().ToLower()
-        }
-        if ($answer -in 'hdd', 'emmc') { $diskProfile = $answer }
-        else {
-            Write-Log "Drive type unknown - nothing changed. Set `$env:NN_SLOWDISK = 'hdd' or 'emmc' and run again." 'WARN'
             Write-Host ""; return
         }
     }
