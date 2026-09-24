@@ -467,12 +467,20 @@ try {
     if ($null -ne $pk.HibernateEnabled) { $hiberOn = ($pk.HibernateEnabled -eq 1) }
     else { $hiberOn = Test-Path (Join-Path $env:SystemDrive 'hiberfil.sys') }
     $hiberTyp = switch ($pk.HiberFileType) { 1 { 'reduced' } 2 { 'full' } default { $null } }
-    $hiberNeedGB = [math]::Round($ramGB * 0.2 + 1, 1)
-    $wantHiber = -not ($isEmmc -and ($drive.FreeGB - $hiberNeedGB) -lt 10)
+    # HiberFileType isn't always written - fall back to the hiberfil.sys size
+    # (reduced is ~20% of RAM, full ~40%).
+    $hf = Get-Item -Force -Path (Join-Path $env:SystemDrive 'hiberfil.sys') -ErrorAction SilentlyContinue
+    if (-not $hiberTyp -and $hiberOn -and $hf -and $ramGB) {
+        $hiberTyp = if (($hf.Length / 1GB) / $ramGB -lt 0.3) { 'reduced' } else { 'full' }
+    }
+    $reducedRejected = Test-Recorded 'note|hiber-reduced-rejected'
+    $hiberGB = [math]::Round($ramGB * 0.2, 1)
+    $wantHiber = -not ($isEmmc -and ($drive.FreeGB - $hiberGB - 1) -lt 10)
     if ($wantHiber) {
         if ($hiberOn -and $hiberTyp -eq 'reduced') { Note-Same 'Fast Startup on (reduced hiberfile)' }
+        elseif ($hiberOn -and $reducedRejected) { Note-Same 'Fast Startup on (full hiberfile - this PC rejects reduced)' }
         else {
-            Note-Change "Fast Startup on with a reduced hiberfile (~$hiberNeedGB GB) - faster cold boots"
+            Note-Change "Fast Startup on with a reduced hiberfile (~$hiberGB GB) - faster cold boots"
             if (-not $DryRun) {
                 Add-Record @{ Id = 'hiber'; Kind = 'hiber'; OldEnabled = $hiberOn; OldType = $hiberTyp; OldSize = $pk.HiberFileSizePercent }
                 $o = Invoke-Native powercfg.exe /hibernate on
@@ -487,6 +495,7 @@ try {
                     if ($LASTEXITCODE -ne 0) {
                         Write-Log "Reduced hiberfile not accepted ($(($o -join ' ').Trim())) - using the full size so Fast Startup still works." 'WARN'
                         Invoke-Native powercfg.exe /hibernate /type full | Out-Null
+                        Add-Record @{ Id = 'note|hiber-reduced-rejected'; Kind = 'note' }
                     }
                 }
             }
