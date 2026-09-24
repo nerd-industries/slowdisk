@@ -588,7 +588,7 @@ try {
     try {
         $mp = Get-MpComputerStatus
         if (-not $mp.AntivirusEnabled -or ($mp.AMRunningMode -and $mp.AMRunningMode -ne 'Normal')) {
-            Write-Log "Defender is in '$($mp.AMRunningMode)' mode (another AV is active) - skipped."
+            Write-Log "Defender isn't the active antivirus here (mode: $(if ($mp.AMRunningMode) { $mp.AMRunningMode } else { 'off' })) - skipped. Make sure another AV is actually installed and running." 'WARN'
         } else {
             $pref = Get-MpPreference
             $want = @(
@@ -646,7 +646,16 @@ try {
             Set-CimInstance -InputObject $cs -Property @{ AutomaticManagedPagefile = $true }
         }
     } elseif ($cs.AutomaticManagedPagefile) { Note-Same 'Page file system managed' }
-    else { Write-Log "Custom page file size in use - left alone." }
+    else {
+        # A small fixed page file on a low-RAM PC causes "out of memory" errors and hangs.
+        $maxMB = ($pfs | Measure-Object -Property MaximumSize -Sum).Sum
+        $sizes = ($pfs | ForEach-Object { "$($_.Name) $($_.InitialSize)-$($_.MaximumSize) MB" }) -join ', '
+        if ($maxMB -gt 0 -and $maxMB -lt [math]::Max(4096, $ramGB * 1024 * 1.5)) {
+            Write-Log "Custom page file is small for $ramGB GB RAM ($sizes) - set it back to 'System managed' in sysdm.cpl > Advanced > Performance > Virtual memory." 'WARN'
+        } else {
+            Write-Log "Custom page file size in use ($sizes) - left alone."
+        }
+    }
     }
 
     # ---- 9. Drive optimization (defrag for HDD, TRIM for eMMC) ----------------
@@ -724,9 +733,9 @@ try {
     # ---- Report-only checks (security or user choices - tech decides) ---------
     Write-Log "Things to look at (not changed)" 'HEAD'
     $minFree = if ($isEmmc) { 20 } else { 15 }
-    if ($drive.FreePct -lt $minFree) { Write-Log "Only $($drive.FreePct)% free - slow drives get much slower when nearly full. Clean up/move data." 'WARN' }
+    if ($drive.FreePct -lt $minFree) { Write-Log "Only $($drive.FreePct)% free ($($drive.FreeGB) GB) - $(if ($isLow) { 'SSDs' } else { 'slow drives' }) get much slower when nearly full, and Windows Update needs room. Clean up/move data." 'WARN' }
     else { Write-Log "Free space OK ($($drive.FreePct)%)" }
-    if ($ramGB -lt 6) { Write-Log "Only $ramGB GB RAM - this machine will page to the slow disk a lot. Upgrade RAM if it isn't soldered." 'WARN' }
+    if ($ramGB -lt 6) { Write-Log "Only $ramGB GB RAM - this is the main limit; Windows will page to disk a lot. A RAM upgrade (if not soldered) helps more than any tweak." 'WARN' }
     try {
         $bl = Get-CimInstance -Namespace 'root\cimv2\Security\MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume -ErrorAction Stop |
               Where-Object { $_.DriveLetter -eq "$($drive.Letter):" }
@@ -742,7 +751,6 @@ try {
         $cq = (Invoke-Native compact.exe /compactos:query) -join ' '
         if ($cq -match 'is in the Compact state') { Write-Log "CompactOS is ON - on an SSD with a weak CPU the decompression can cost more than it saves. Undo: compact /compactos:never" 'WARN' }
     }
-    if ($isLow -and $lowRam) { Write-Log "RAM is the main limit here - a RAM upgrade (if not soldered) will help more than any tweak." 'WARN' }
     if ($isHdd) { Write-Log "Best fix for this PC is still a SATA SSD swap (~`$25-40) - bigger than every tweak combined." 'WARN' }
     $startup = @(Get-CimInstance Win32_StartupCommand -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name -Unique)
     if ($startup.Count) { Write-Log ("Startup apps ({0}): {1}" -f $startup.Count, ($startup -join ', ')) }
