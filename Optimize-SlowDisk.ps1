@@ -585,29 +585,54 @@ try {
 
     # ---- 5. Defender: throttle scans, never disable ---------------------------
     Invoke-Step 'Defender: throttle scans, never disable' {
-    try {
-        $mp = Get-MpComputerStatus
-        if (-not $mp.AntivirusEnabled -or ($mp.AMRunningMode -and $mp.AMRunningMode -ne 'Normal')) {
-            Write-Log "Defender isn't the active antivirus here (mode: $(if ($mp.AMRunningMode) { $mp.AMRunningMode } else { 'off' })) - skipped. Make sure another AV is actually installed and running." 'WARN'
-        } else {
-            $pref = Get-MpPreference
-            $want = @(
-                @{ N = 'EnableLowCpuPriority';  Cur = [bool]$pref.EnableLowCpuPriority;  New = $true; L = 'Defender scans run at low priority' },
-                @{ N = 'ScanOnlyIfIdleEnabled'; Cur = [bool]$pref.ScanOnlyIfIdleEnabled; New = $true; L = 'Defender scheduled scans only when idle' }
-            )
-            $load = [int]$pref.ScanAvgCPULoadFactor
-            if ($load -eq 0 -or $load -gt 25) {
-                $want += @{ N = 'ScanAvgCPULoadFactor'; Cur = $load; New = [byte]25; L = "Defender scan CPU cap 25% (was $load)" }
-            } else { Note-Same "Defender scan CPU cap $load%" }
+    # When another AV (e.g. a temporary Malwarebytes install) is registered,
+    # Defender is switched off. We still try to save the scan settings so they
+    # are in place the moment Defender takes over again.
+    $mp = $null
+    try { $mp = Get-MpComputerStatus -ErrorAction Stop } catch { }
+    $active = $mp -and $mp.AntivirusEnabled -and (-not $mp.AMRunningMode -or $mp.AMRunningMode -eq 'Normal')
+    if (-not $active) {
+        $modeTxt = if ($mp -and $mp.AMRunningMode) { $mp.AMRunningMode } else { 'off' }
+        Write-Log "Defender isn't the active antivirus right now (mode: $modeTxt) - saving its scan settings anyway for when it's back."
+    }
+    try { $pref = Get-MpPreference -ErrorAction Stop }
+    catch {
+        Write-Log "Can't read Defender settings while it's off. Re-run this script after the other AV is removed - it will only do the Defender part." 'WARN'
+        $script:Skipped++; return
+    }
+    $want = @(
+        @{ N = 'EnableLowCpuPriority';  Cur = [bool]$pref.EnableLowCpuPriority;  New = $true; L = 'Defender scans run at low priority' },
+        @{ N = 'ScanOnlyIfIdleEnabled'; Cur = [bool]$pref.ScanOnlyIfIdleEnabled; New = $true; L = 'Defender scheduled scans only when idle' }
+    )
+    $load = [int]$pref.ScanAvgCPULoadFactor
+    if ($load -eq 0 -or $load -gt 25) {
+        $want += @{ N = 'ScanAvgCPULoadFactor'; Cur = $load; New = [byte]25; L = "Defender scan CPU cap 25% (was $load)" }
+    } else { Note-Same "Defender scan CPU cap $load%" }
+    $failed = @()
+    foreach ($w in $want) {
+        if ($w.Cur -eq $w.New) { Note-Same $w.L; continue }
+        Note-Change $w.L
+        if ($DryRun) { continue }
+        try {
+            $p = @{ $w.N = $w.New; ErrorAction = 'Stop' }; Set-MpPreference @p
+            Add-Record @{ Id = "mp|$($w.N)"; Kind = 'mp'; Name = $w.N; OldValue = $w.Cur }
+        } catch { $failed += $w.N }
+    }
+    if (-not $DryRun -and $want.Count) {
+        # Set-MpPreference can "succeed" without sticking while Defender is off - re-read to be sure.
+        try {
+            $after = Get-MpPreference -ErrorAction Stop
             foreach ($w in $want) {
-                if ($w.Cur -eq $w.New) { Note-Same $w.L; continue }
-                Note-Change $w.L
-                if ($DryRun) { continue }
-                Add-Record @{ Id = "mp|$($w.N)"; Kind = 'mp'; Name = $w.N; OldValue = $w.Cur }
-                $p = @{ $w.N = $w.New }; Set-MpPreference @p
+                $now = if ($w.N -eq 'ScanAvgCPULoadFactor') { [int]$after.($w.N) } else { [bool]$after.($w.N) }
+                if ($now -ne $w.New -and $failed -notcontains $w.N) { $failed += $w.N }
             }
-        }
-    } catch { Write-Log "Defender settings skipped: $($_.Exception.Message)" 'WARN'; $script:Skipped++ }
+        } catch { }
+    }
+    if ($failed.Count) {
+        Write-Log ("Windows didn't accept Defender setting(s): {0}. {1}" -f ($failed -join ', '),
+            $(if ($active) { 'Tamper Protection or a policy may be blocking it.' } else { 'Re-run this script after the other AV is removed - it will only redo what is missing.' })) 'WARN'
+        $script:Skipped++
+    }
     }
 
     # ---- 6. Compatibility Appraiser (CompatTelRunner full-disk scans) ---------
